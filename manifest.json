@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "NRK English Subtitles",
+  "version": "1.4.0",
+  "description": "Translates NRK TV subtitles to English in real time.",
+  "permissions": [],
+  "host_permissions": [
+    "https://psapi.nrk.no/*",
+    "https://undertekst.nrk.no/*",
+    "https://translate.googleapis.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://tv.nrk.no/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "NRK English Subtitles"
+  }
+}
