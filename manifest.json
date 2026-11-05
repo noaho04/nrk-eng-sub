@@ -4,6 +4,9 @@
   "version": "1.4.0",
   "description": "Translates NRK TV subtitles to English in real time.",
   "permissions": [],
+  "background": {
+    "service_worker": "background.js"
+  },
   "host_permissions": [
     "https://psapi.nrk.no/*",
     "https://undertekst.nrk.no/*",
@@ -12,7 +15,10 @@
   "content_scripts": [
     {
       "matches": ["https://tv.nrk.no/*"],
-      "js": ["content.js"],
+      "js": [
+        "overlay.js",
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ],

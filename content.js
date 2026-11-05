@@ -1,28 +1,18 @@
+
 /**
- * NRK English Subtitles — content script
- *
- * 1. Fetch the VTT subtitle file for the current episode via NRK's API.
- * 2. Translate every line into a cache via Google Translate.
- * 3. Lock the video until translation is complete.
- * 4. Watch the subtitle DOM element and replace each line from the cache.
- *    Cache misses are translated on the fly so nothing is left in Norwegian.
- * 5. Re-runs on SPA navigation between episodes.
+ * NRK English Subtitles — native TextTrack version
  */
 
-// ─── Program ID ───────────────────────────────────────────────────────────────
-
 function getProgramId() {
-  const match = location.pathname.match(/([A-Z]{2,6}\d{6,12})/);
-  return match ? match[1] : null;
+  return location.pathname.match(/([A-Z]{2,6}\d{6,12})/)?.[1] || null;
 }
 
 async function getVttUrl(programId) {
   const resp = await fetch(`https://psapi.nrk.no/playback/manifest/program/${programId}`);
   if (!resp.ok) throw new Error(`Manifest fetch failed: ${resp.status}`);
+
   const data = await resp.json();
   const subs = data?.playable?.subtitles ?? [];
-
-  // Prefer the SDH ("på all tale") track — it has the full subtitle text.
   const preferred =
     subs.find(s => s.webVtt && /sdh/i.test(s.webVtt) && !/non-sdh/i.test(s.webVtt)) ||
     subs.find(s => s.defaultOn && s.webVtt) ||
@@ -32,66 +22,76 @@ async function getVttUrl(programId) {
   let url = preferred?.webVtt || preferred?.url;
   if (!url) throw new Error("No subtitle URL in manifest");
 
-  // If only a partial "non-sdh-translated" file was returned, probe for the
-  // full SDH version by trying common version suffixes in parallel.
   if (/non-sdh-translated/i.test(url)) {
     const versions = ["170004", "170003", "170005", "170002", "170001", "170006"];
     const probes = versions.map(v => {
-      const sdhUrl = url.replace(/non-sdh-translated-\d+/, `sdh-${v}`);
-      return fetch(sdhUrl, { method: "HEAD" })
-        .then(r => r.ok ? sdhUrl : null)
-        .catch(() => null);
+      const candidate = url.replace(/non-sdh-translated-\d+/, `sdh-${v}`);
+      return fetch(candidate, { method: "HEAD" })
+        .then(r => r.ok ? candidate : null).catch(() => null);
     });
-    const sdh = (await Promise.all(probes)).find(r => r !== null);
+    const sdh = (await Promise.all(probes)).find(Boolean);
     if (sdh) url = sdh;
   }
-
   return url;
 }
 
-// ─── VTT parsing ──────────────────────────────────────────────────────────────
+// Preserve timestamps while extracting the lines for translation.
+function parseVTT(vtt) {
+  const cues = [];
+  const timing = /((?:\d+:)?\d{2}:\d{2}[.,]\d{3})\s*-->\s*((?:\d+:)?\d{2}:\d{2}[.,]\d{3})/;
 
-function parseVTT(vttText) {
-  const lines = new Set();
-  const raw = vttText.split("\n");
-  let i = 0;
-  while (i < raw.length) {
-    if (raw[i].includes("-->")) {
-      i++;
-      while (i < raw.length && raw[i].trim() !== "") {
-        const clean = raw[i].replace(/<[^>]+>/g, "").trim();
-        if (clean) lines.add(clean);
-        i++;
-      }
-    } else {
-      i++;
-    }
+  const seconds = t => t.replace(",", ".").split(":")
+    .reduce((total, n) => total * 60 + Number(n), 0);
+
+  for (const block of vtt.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").split(/\n\s*\n/)) {
+    const lines = block.split("\n");
+    const index = lines.findIndex(l => timing.test(l));
+    if (index < 0) continue;
+
+    const match = lines[index].match(timing);
+    const text = lines.slice(index + 1)
+      .map(l => l.replace(/<[^>]*>/g, "").trim())
+      .filter(Boolean).join("\n");
+
+    const start = seconds(match[1]), end = seconds(match[2]);
+    if (text && Number.isFinite(start) && Number.isFinite(end) && end > start)
+      cues.push({ start, end, text });
   }
-  return [...lines];
+  return cues;
 }
 
-// ─── Translation ──────────────────────────────────────────────────────────────
+// translation pipeline
 
 async function translateOne(text) {
-  const url = new URL("https://translate.googleapis.com/translate_a/single");
-  url.searchParams.set("client", "gtx");
-  url.searchParams.set("sl", "no");
-  url.searchParams.set("tl", "en");
-  url.searchParams.set("dt", "t");
-  url.searchParams.set("q", text);
-  const resp = await fetch(url.toString());
-  if (!resp.ok) throw new Error(`Translate API ${resp.status}`);
-  const data = await resp.json();
-  return data[0].map(p => p[0]).join("").trim();
+  const response = await chrome.runtime.sendMessage({
+    type: "translate",
+    text
+  });
+
+  if (response?.error) {
+    throw new Error(response.error);
+  }
+
+  if (typeof response?.text !== "string") {
+    throw new Error("Invalid translation response");
+  }
+
+  return response.text;
 }
 
+
 async function translateChunk(texts) {
-  return Promise.all(texts.map(t => translateOne(t).catch(() => t)));
+  const results = [];
+
+  for (const text of texts) {
+    results.push(await translateOne(text));
+  }
+
+  return results;
 }
 
 async function buildCache(lines, onProgress) {
-  const cache = new Map();
-  const CHUNK = 40;
+  const cache = new Map(), CHUNK = 40;
   for (let i = 0; i < lines.length; i += CHUNK) {
     const chunk = lines.slice(i, i + CHUNK);
     const translated = await translateChunk(chunk);
@@ -101,206 +101,184 @@ async function buildCache(lines, onProgress) {
   return cache;
 }
 
-// ─── Overlay ──────────────────────────────────────────────────────────────────
-
-let overlay = null, statusEl = null;
-
-function showOverlay(msg) {
-  if (overlay) { if (statusEl) statusEl.textContent = msg; return; }
-  const style = document.createElement("style");
-  style.textContent = `@keyframes _nrk_spin { to { transform: rotate(360deg); } }`;
-  document.head.appendChild(style);
-  overlay = document.createElement("div");
-  overlay.style.cssText = `position:fixed;inset:0;z-index:2147483647;background:rgba(10,10,10,0.85);
-    backdrop-filter:blur(8px);display:flex;flex-direction:column;align-items:center;
-    justify-content:center;font-family:ui-sans-serif,sans-serif;color:#fff;gap:16px;`;
-  const spinner = document.createElement("div");
-  spinner.style.cssText = `width:36px;height:36px;border:3px solid rgba(255,255,255,0.15);
-    border-top-color:#fff;border-radius:50%;animation:_nrk_spin 0.8s linear infinite;`;
-  const label = document.createElement("div");
-  label.style.cssText = `font-size:11px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;opacity:0.45;`;
-  label.textContent = "NRK English Subtitles";
-  statusEl = document.createElement("div");
-  statusEl.style.cssText = `font-size:15px;font-weight:500;max-width:320px;text-align:center;line-height:1.5;`;
-  statusEl.textContent = msg;
-  overlay.append(spinner, label, statusEl);
-  document.body.appendChild(overlay);
-}
-
-function hideOverlay() {
-  overlay?.remove(); overlay = null; statusEl = null;
-}
-
-// ─── Video lock ───────────────────────────────────────────────────────────────
-
 function lockVideo(video) {
   video.pause();
-  const onPlay = () => { if (video._nrkLocked) video.pause(); };
-  video._nrkLocked = true;
+  const onPlay = () => video.pause();
   video.addEventListener("play", onPlay);
-  return () => { video._nrkLocked = false; video.removeEventListener("play", onPlay); };
+  return () => video.removeEventListener("play", onPlay);
 }
 
 function waitForVideo() {
   return new Promise(resolve => {
     const v = document.querySelector("video");
     if (v) return resolve(v);
+
     const obs = new MutationObserver(() => {
-      const v = document.querySelector("video");
-      if (v) { obs.disconnect(); resolve(v); }
+      const video = document.querySelector("video");
+      if (video) { obs.disconnect(); resolve(video); }
     });
     obs.observe(document.documentElement, { childList: true, subtree: true });
   });
 }
 
-// ─── Subtitle observer ────────────────────────────────────────────────────────
+// Native English subtitle track.
+const TRACK_LABEL = "English (NRK Translated)";
+let translatedCues = null;
+let activeVideo = null;
+let stopTrack = () => {};
 
-const SELECTORS = [
-  "tv-player-subtitles .tv-player-subtitle-text",
-  ".tv-player-subtitle-text",
-  "[class*='subtitle-text']",
-  "tv-player-subtitles span",
-];
+function installTrack(video, cues) {
+  if (!video || !cues?.length) return;
 
-function findSubtitleSpan() {
-  for (const sel of SELECTORS) {
-    const el = document.querySelector(sel);
-    if (el) return el;
+  let track = [...video.textTracks].find(t => t.label === TRACK_LABEL);
+  if (!track) track = video.addTextTrack("subtitles", TRACK_LABEL, "en");
+
+  track.mode = "hidden";
+
+  // Reuse the track; never create duplicate English tracks.
+  for (const cue of [...(track.cues || [])]) track.removeCue(cue);
+
+  for (const item of cues) {
+    const cue = new VTTCue(item.start, item.end, item.text);
+    cue.snapToLines = false;
+    cue.line = 92;
+    cue.lineAlign = "end";
+    cue.align = "center";
+    track.addCue(cue);
   }
-  return null;
+
+  for (const other of video.textTracks)
+    if (other !== track) other.mode = "disabled";
+
+  track.mode = "showing";
+  activeVideo = video;
+
+  console.log("[NRK] English cues:", track.cues?.length);
 }
 
-function observeSubtitles(cache) {
-  let spanRef = null;
-  let lastInput = "";
-
-  async function translateAndSet(span, norwegianText) {
-    try {
-      const lines = norwegianText.split("\n").map(l => l.trim()).filter(Boolean);
-      const translated = await translateChunk(lines);
-      lines.forEach((orig, i) => { if (!cache.has(orig)) cache.set(orig, translated[i] || orig); });
-      const result = translated.join("\n");
-      if (span.isConnected && lastInput === norwegianText) {
-        lastInput = result;
-        span.textContent = result;
-      }
-    } catch { /* leave as-is */ }
-  }
-
-  function onMutation() {
-    const span = spanRef || (spanRef = findSubtitleSpan());
-    if (!span) return;
-    if (!span.isConnected) { spanRef = null; return; }
-
-    const text = span.textContent.trim();
-    if (!text || text === lastInput) return;
-    lastInput = text;
-
-    // Look up each line individually (the DOM joins multi-line cues with \n).
-    const lines = text.split("\n").map(l => l.trim());
-    const hits = lines.map(line => cache.get(line));
-
-    if (hits.every(h => h !== undefined)) {
-      const result = hits.join("\n");
-      if (result !== text) { lastInput = result; span.textContent = result; }
-    } else {
-      translateAndSet(span, text);
+// Hide NRK's own Norwegian subtitle element, NOT the native English track.
+function hideOriginalSubtitles() {
+  if (document.getElementById("nrk-english-style")) return;
+  const style = document.createElement("style");
+  style.id = "nrk-english-style";
+  style.textContent = `
+    tv-player-subtitles,
+    .tv-player-subtitle-text {
+      display: none !important;
     }
-  }
-
-  function attach(container) {
-    const obs = new MutationObserver(onMutation);
-    obs.observe(container, { childList: true, characterData: true, subtree: true });
-    onMutation();
-    return () => obs.disconnect();
-  }
-
-  const existing = document.querySelector("tv-player-subtitles") ||
-                   document.querySelector("[class*='subtitle']");
-  if (existing) return attach(existing);
-
-  let detach = () => {};
-  const waitObs = new MutationObserver((_, obs) => {
-    const el = document.querySelector("tv-player-subtitles") ||
-               document.querySelector("[class*='subtitle']");
-    if (el) { obs.disconnect(); detach = attach(el); }
-  });
-  waitObs.observe(document.documentElement, { childList: true, subtree: true });
-  return () => { waitObs.disconnect(); detach(); };
+  `;
+  document.head.appendChild(style);
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
-
+// Main — original workflow with TextTrack replacing the DOM observer.
 let currentRun = 0;
 let lastProcessedId = null;
-let stopObserver = null;
 
 async function main() {
   const programId = getProgramId();
-  if (!programId) return;
-  if (programId === lastProcessedId) return;
+  if (!programId || programId === lastProcessedId) return;
 
   const run = ++currentRun;
   lastProcessedId = programId;
   const stale = () => run !== currentRun;
-
-  if (stopObserver) { stopObserver(); stopObserver = null; }
+  stopTrack();
+  stopTrack = () => {};
+  translatedCues = null;
+  activeVideo = null;
 
   let unlock = () => {};
+
   try {
-    showOverlay("Fetching subtitle data…");
-    const [video, vttUrl] = await Promise.all([waitForVideo(), getVttUrl(programId)]);
+    LoadingOverlay.show("Fetching subtitle data…");
+    const [video, vttUrl] = await Promise.all([
+      waitForVideo(), getVttUrl(programId)
+    ]);
     if (stale()) return;
 
     unlock = lockVideo(video);
+    LoadingOverlay.show("Downloading subtitles…");
 
-    showOverlay("Downloading subtitles…");
     const vttResp = await fetch(vttUrl);
-    if (stale()) { unlock(); hideOverlay(); return; }
     if (!vttResp.ok) throw new Error(`VTT fetch failed: ${vttResp.status}`);
 
-    const lines = parseVTT(await vttResp.text());
-    if (lines.length === 0) throw new Error("No subtitle lines found");
+    const cues = parseVTT(await vttResp.text());
+    if (!cues.length) throw new Error("No subtitle cues found");
 
-    showOverlay(`Translating… (0 / ${lines.length})`);
+    const lines = [...new Set(cues.flatMap(c =>
+      c.text.split("\n").map(l => l.trim()).filter(Boolean)
+    ))];
+
+    LoadingOverlay.update(`Translating… (0 / ${lines.length})`);
     const cache = await buildCache(lines, (done, total) => {
-      if (!stale()) showOverlay(`Translating… (${done} / ${total})`);
+      if (!stale()) LoadingOverlay.update(`Translating… (${done} / ${total})`);
     });
-    if (stale()) { unlock(); hideOverlay(); return; }
-
-    stopObserver = observeSubtitles(cache);
-    unlock();
-    hideOverlay();
-  } catch (err) {
     if (stale()) return;
-    console.error("[NRK]", err);
-    showOverlay(`Error: ${err.message}`);
+
+    translatedCues = cues.map(c => ({
+      ...c,
+      text: c.text.split("\n").map(l => cache.get(l.trim()) || l).join("\n")
+    }));
+
+    hideOriginalSubtitles();
+    installTrack(document.querySelector("video") || video, translatedCues);
+
+    stopTrack = () => {
+      const track = activeVideo && [...activeVideo.textTracks]
+        .find(t => t.label === TRACK_LABEL);
+      if (track) track.mode = "disabled";
+    };
+
+    LoadingOverlay.hide();
+  } catch (err) {
+    if (!stale()) {
+      console.error("[NRK]", err);
+      LoadingOverlay.show(`Error: ${err.message}`);
+      setTimeout(LoadingOverlay.hide, 4000);
+    }
+  } finally {
     unlock();
-    setTimeout(hideOverlay, 4000);
-    stopObserver = observeSubtitles(new Map());
   }
 }
 
-// ─── SPA navigation ───────────────────────────────────────────────────────────
-
+// Original navigation handling + minimal track repair.
 (function watchNavigation() {
   function check() {
     const id = getProgramId();
     if (id && id !== lastProcessedId) main();
+    if (!id && lastProcessedId) {
+      ++currentRun;
+      stopTrack();
+      translatedCues = null;
+      lastProcessedId = null;
+      LoadingOverlay.hide();
+    }
   }
 
-  // History API (most SPAs).
   const origPush = history.pushState.bind(history);
   history.pushState = function (...args) { origPush(...args); check(); };
+
   const origReplace = history.replaceState.bind(history);
   history.replaceState = function (...args) { origReplace(...args); check(); };
-  window.addEventListener("popstate", check);
 
-  // Navigation API (Chrome 102+).
+  window.addEventListener("popstate", check);
   window.navigation?.addEventListener("navigate", check);
 
-  // Polling fallback for any navigation method not caught above.
-  setInterval(check, 1000);
+  setInterval(() => {
+    check();
+    if (!translatedCues) return;
+
+    const video = document.querySelector("video");
+    if (!video) return;
+
+    const track = [...video.textTracks].find(t => t.label === TRACK_LABEL);
+    if (video !== activeVideo || !track || track.cues?.length !== translatedCues.length) {
+      installTrack(video, translatedCues);
+    } else {
+      for (const other of video.textTracks)
+        if (other !== track) other.mode = "disabled";
+      track.mode = "showing";
+    }
+  }, 1000);
 })();
 
 main();
